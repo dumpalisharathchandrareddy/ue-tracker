@@ -23,7 +23,6 @@
 //
 // -----------------------------------------------------------------------------
 // Install:  npm i discord.js@14 puppeteer cheerio better-sqlite3 express dotenv
-// Run:      node app.js
 // -----------------------------------------------------------------------------
 
 import 'dotenv/config';
