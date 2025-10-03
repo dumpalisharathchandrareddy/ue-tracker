@@ -1,7 +1,6 @@
-# Dockerfile — Discord UberEats tracker (Railway ready)
 FROM node:22-bookworm
 
-# Install Chromium + runtime deps + curl for healthcheck
+# Chromium + deps + curl for healthcheck
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     ca-certificates \
@@ -26,27 +25,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
   && rm -rf /var/lib/apt/lists/*
 
-# Use system Chromium (Puppeteer won’t download its own)
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 ENV CHROME_PATH=/usr/bin/chromium
 
 WORKDIR /app
 
-# Install deps
 COPY package*.json ./
-# Prefer clean install; if lockfile mismatch, fall back to install
 RUN npm ci --omit=dev || npm install --omit=dev
 
-# Copy app
 COPY . .
 
-# Railway provides PORT env at runtime; don't hardcode it here
-# Expose is optional for docs only
+# Do not set ENV PORT — Railway injects it
 EXPOSE 3000
 
-# Healthcheck: use Railway-provided $PORT
+# Healthcheck that tolerates missing PORT by defaulting to 3000 (for local tests)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s \
-  CMD sh -lc 'curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null || exit 1'
+  CMD sh -lc 'curl -fsS "http://127.0.0.1:${PORT:-3000}/health" >/dev/null || exit 1'
 
-# Start the bot
 CMD ["node", "app.js"]

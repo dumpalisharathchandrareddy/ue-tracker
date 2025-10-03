@@ -771,11 +771,23 @@ client.on('interactionCreate', async (i) => {
 });
 
 /* ─────────────── HTTP / Boot / Restartable ─────────────── */
-if (PORT) {
-  const app = express();
-  app.get('/health', (_req, res) => res.json({ ok: true, now: nowIso(), pid: process.pid }));
-  app.listen(PORT, () => log(`🌐 HTTP on :${PORT}`));
-}
+// --- HTTP / Health (Railway needs this to pass) ---
+const ACTUAL_PORT = Number(process.env.PORT) || 3000; // Railway injects PORT at runtime
+const app = express();
+
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    ts: new Date().toISOString(),
+    pid: process.pid,
+    port: ACTUAL_PORT,
+  });
+});
+app.get('/', (_req, res) => res.status(200).send('OK'));
+
+app.listen(ACTUAL_PORT, () => console.log(`🌐 HTTP listening on :${ACTUAL_PORT}`));
+
+// --- Global error handlers / ops notify ---
 process.on('unhandledRejection', (e) => {
   const msg = 'UNHANDLED REJECTION: ' + String(e?.stack || e);
   err(msg); notifyOps('⚠️ ' + msg);
@@ -785,10 +797,11 @@ process.on('uncaughtException',  (e) => {
   err(msg); notifyOps('⚠️ ' + msg);
 });
 
+// --- Boot ---
 log('🚀 Boot', {
   node: process.version,
   DEBUG, GUILD_ID: process.env.GUILD_ID, APP_ID: process.env.DISCORD_APP_ID,
-  PORT, POLL_INTERVAL_MS, DB_PATH, THEME, SCRAPE_DELAY_MS,
+  PORT: ACTUAL_PORT, POLL_INTERVAL_MS, DB_PATH, THEME, SCRAPE_DELAY_MS,
 });
 
 await (async () => {
@@ -805,13 +818,29 @@ client.once('clientReady', async () => {
 client.once('ready', async () => {
   log(`✅ Discord ready as ${client.user.tag}`);
 });
-process.on('SIGINT', async () => {
-  log('Shutting down…');
+
+// Graceful stops (Railway sends SIGTERM on deploy/stop)
+process.on('SIGTERM', async () => {
+  console.log('🛑 SIGTERM received — shutting down gracefully');
   try {
     for (const [, t] of timers) clearInterval(t);
     timers.clear();
     for (const [, p] of pages) { try { await p.close({ runBeforeUnload: true }); } catch {} }
     pages.clear();
     if (_browser) await _browser.close();
-  } finally { process.exit(0); }
+  } finally {
+    process.exit(0);
+  }
+});
+process.on('SIGINT', async () => {
+  console.log('🛑 SIGINT received — shutting down gracefully');
+  try {
+    for (const [, t] of timers) clearInterval(t);
+    timers.clear();
+    for (const [, p] of pages) { try { await p.close({ runBeforeUnload: true }); } catch {} }
+    pages.clear();
+    if (_browser) await _browser.close();
+  } finally {
+    process.exit(0);
+  }
 });
