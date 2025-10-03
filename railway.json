@@ -12,7 +12,7 @@
         "us-east4-eqdc4a": { "numReplicas": 1 }
       },
       "restartPolicyType": "ALWAYS",
-      "restartPolicyMaxRetries": 0
+      "restartPolicyMaxRetries": 1
     }
   }
   
