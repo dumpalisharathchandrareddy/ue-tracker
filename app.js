@@ -21,6 +21,9 @@
 // OWNER_USER_ID=123456789012345678
 // DISCORD_LOG_CHANNEL_ID=123456789012345678
 //
+// Bridge secret (must match 116-bot):
+// BRIDGE_SECRET=superlongrandomsecret
+//
 // -----------------------------------------------------------------------------
 // Install:  npm i discord.js@14 puppeteer cheerio better-sqlite3 express dotenv
 // -----------------------------------------------------------------------------
@@ -39,6 +42,7 @@ import {
   ButtonStyle,
   PermissionsBitField,
   MessageFlags,
+  Partials, // for DMs
 } from 'discord.js';
 import puppeteer from 'puppeteer';
 import * as cheerio from 'cheerio';
@@ -71,7 +75,9 @@ const client = new Client({
     GatewayIntentBits.GuildMembers, // enable in dev portal
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages, // DMs for subscriber updates
   ],
+  partials: [Partials.Channel], // allow DMs
 });
 function getGuildIconURL(guild) {
   try { return guild?.iconURL({ size: 128, extension: 'png' }) || null; } catch { return null; }
@@ -107,6 +113,20 @@ async function dmRequester(userId, text) {
   } catch {}
 }
 
+/* ─────────────── Bridge (notify 116-bot via channel message) ─────────────── */
+const BRIDGE_SECRET = process.env.BRIDGE_SECRET; // must match 116-bot
+
+async function notifyCompletedInChannel(client, channelId, payload) {
+  // payload: { userId, orderId, total, secret }
+  try {
+    const ch = await client.channels.fetch(channelId).catch(() => null);
+    if (!ch || !ch.isTextBased?.()) throw new Error('Bridge channel not text-based or not found');
+    await ch.send('!completed ' + JSON.stringify(payload));
+  } catch (e) {
+    err('bridge notify failed:', e?.message || e);
+  }
+}
+
 /* ─────────────── DB (SQLite, source of truth) ─────────────── */
 if (!DB_PATH) {
   console.error('❌ DB_PATH is required (use /data/tracker.db on Railway).');
@@ -134,12 +154,31 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_jobs_channel ON jobs(channel_id);
   CREATE INDEX IF NOT EXISTS idx_jobs_url ON jobs(url);
 `);
+// --- lightweight migration for dm_user_id (persists DM subscription) ---
+try {
+  const cols = db.prepare('PRAGMA table_info(jobs)').all();
+  const hasDm = cols.some(c => c.name === 'dm_user_id');
+  if (!hasDm) db.exec('ALTER TABLE jobs ADD COLUMN dm_user_id TEXT');
+} catch {}
+
 const DB = {
   insert(job) {
     const now = nowIso();
     const stmt = db.prepare(`
-      INSERT INTO jobs (url, guild_id, channel_id, message_id, assignee_user_id, requester_user_id, static_name, last_phase, last_hash, last_error_at, created_at, updated_at)
-      VALUES (@url, @guild_id, @channel_id, @message_id, @assignee_user_id, @requester_user_id, @static_name, @last_phase, @last_hash, @last_error_at, @created_at, @updated_at)
+      INSERT INTO jobs (
+        url, guild_id, channel_id, message_id,
+        assignee_user_id, requester_user_id, static_name,
+        last_phase, last_hash, last_error_at,
+        dm_user_id,
+        created_at, updated_at
+      )
+      VALUES (
+        @url, @guild_id, @channel_id, @message_id,
+        @assignee_user_id, @requester_user_id, @static_name,
+        @last_phase, @last_hash, @last_error_at,
+        @dm_user_id,
+        @created_at, @updated_at
+      )
     `);
     return stmt.run({ ...job, created_at: now, updated_at: now });
   },
@@ -211,6 +250,19 @@ async function gotoIfNeeded(page, url) {
 }
 
 /* ─────────────── Helpers ─────────────── */
+// DM UPDATES: control row with link + DM toggle (stateful)
+const controlsRow = (link, dmOn = false) =>
+  new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setStyle(ButtonStyle.Link)
+      .setURL(link || 'https://www.ubereats.com/')
+      .setLabel('Track Order'),
+    new ButtonBuilder()
+      .setStyle(dmOn ? ButtonStyle.Success : ButtonStyle.Secondary)
+      .setCustomId('dm-updates')
+      .setLabel(dmOn ? 'DM Updates ON' : 'Enable DM Updates')
+  );
+
 async function resolveChannelAssignee(channel, roleId) {
   try {
     const guild = channel.guild;
@@ -498,7 +550,8 @@ const linkRow = (link, delivered = false) =>
 /* ─────────────── Runtime maps ─────────────── */
 const timers = new Map(); // message_id -> Timer
 const pages  = new Map(); // message_id -> Puppeteer.Page
-const states = new Map(); // message_id -> { lastPhase, staticName, assigneeUserId }
+// add dmUserId to state (in-memory mirror of dm_user_id)
+const states = new Map(); // message_id -> { lastPhase, staticName, assigneeUserId, dmUserId }
 
 /* ─────────────── Discord message helpers ─────────────── */
 async function fetchMessage(channelId, messageId) {
@@ -556,7 +609,7 @@ async function runOnceAndUpdate(messageId) {
       await safeEditOrRepost(job, {
         content: '⚠️ This link appears to require login on Uber. Please provide a **public** tracking link.',
         embeds: [],
-        components: [linkRow(job.url)],
+        components: [controlsRow(job.url, !!(states.get(job.message_id)?.dmUserId))],
       });
       await dmRequester(job.requester_user_id, '⚠️ Your Uber Eats link appears to require login. Please provide a **public** tracking link.');
       clearInterval(timers.get(messageId)); timers.delete(messageId);
@@ -576,37 +629,36 @@ async function runOnceAndUpdate(messageId) {
     const phase = classifyPhase(data.statusLine || data.statusText) || st.lastPhase || null;
     const deliveredNow = !!data.delivered || phase === 'DELIVERED';
 
-    // Single-member role ping on phase changes only
-    if (st.assigneeUserId) {
-      const ch = await client.channels.fetch(job.channel_id);
-      if (!st.lastPhase && phase) {
-        const label = phase === 'PREPARING' ? 'Preparing'
-          : phase === 'HEADING' ? 'Heading your way'
-          : phase === 'ALMOST_HERE' ? 'Almost here'
-          : 'Delivered';
-        await ch.send({
-          content: `<@${st.assigneeUserId}> **Started tracking: ${label}**${data.etaLine ? ` — *${data.etaLine}*` : ''}`,
-          allowedMentions: { users: [st.assigneeUserId], parse: [] },
-        }).catch(() => {});
-      } else if (phase && st.lastPhase && phase !== st.lastPhase) {
-        const label = phase === 'PREPARING' ? 'Preparing'
-          : phase === 'HEADING' ? 'Heading your way'
-          : phase === 'ALMOST_HERE' ? 'Almost here'
-          : 'Delivered';
-        await ch.send({
-          content: `<@${st.assigneeUserId}> **Status Update:** ${label}${data.etaLine ? ` — *${data.etaLine}*` : ''}`,
-          allowedMentions: { users: [st.assigneeUserId], parse: [] },
-        }).catch(() => {});
-      }
+    // DM updates (no ticket pings during tracking)
+    const dmUserId = st.dmUserId || null;
+    if (dmUserId) {
+      try {
+        const user = await client.users.fetch(dmUserId).catch(() => null);
+        if (user) {
+          if (!st.lastPhase && phase) {
+            const label = phase === 'PREPARING' ? 'Preparing'
+              : phase === 'HEADING' ? 'Heading your way'
+              : phase === 'ALMOST_HERE' ? 'Almost here'
+              : 'Delivered';
+            await user.send(`🔔 **Tracking started:** ${label}${data.etaLine ? ` — *${data.etaLine}*` : ''}`).catch(() => {});
+          } else if (phase && st.lastPhase && phase !== st.lastPhase) {
+            const label = phase === 'PREPARING' ? 'Preparing'
+              : phase === 'HEADING' ? 'Heading your way'
+              : phase === 'ALMOST_HERE' ? 'Almost here'
+              : 'Delivered';
+            await user.send(`🔔 **Status update:** ${label}${data.etaLine ? ` — *${data.etaLine}*` : ''}`).catch(() => {});
+          }
+        }
+      } catch {}
     }
     st.lastPhase = phase;
 
-    // Build embed
+    // Build embed + controls (show DM toggle until delivered)
     const guild = await client.guilds.fetch(job.guild_id);
     const serverIconURL = getGuildIconURL(guild);
     const payload = deliveredNow
       ? { content: '', embeds: [buildDeliveredEmbed(data, job.url, { serverIconURL })], components: [linkRow(job.url, true)] }
-      : { content: '', embeds: [buildActiveEmbed(data, job.url, { serverIconURL })],   components: [linkRow(job.url, false)] };
+      : { content: '', embeds: [buildActiveEmbed(data, job.url, { serverIconURL })],   components: [controlsRow(job.url, !!dmUserId)] };
 
     // Edit only on change
     const h = hashPayload(payload);
@@ -617,15 +669,31 @@ async function runOnceAndUpdate(messageId) {
       });
     }
 
-    // Delivered → finalize
+    // Delivered → finalize (ping in ticket once, DM if subscribed)
     if (deliveredNow) {
-      if (st.assigneeUserId) {
-        const channel = await client.channels.fetch(job.channel_id);
+      const channel = await client.channels.fetch(job.channel_id).catch(() => null);
+
+      if (dmUserId) {
+        // DM final
+        try {
+          const u = await client.users.fetch(dmUserId).catch(() => null);
+          if (u) await u.send(`✅ **Order Arrived!** Enjoy your order!`).catch(() => {});
+        } catch {}
+        // Ticket ping once (mention subscriber)
+        if (channel) {
+          await channel.send({
+            content: `<@${dmUserId}> ✅ **Order Arrived!** Enjoy your order!`,
+            allowedMentions: { users: [dmUserId], parse: [] },
+          }).catch(() => {});
+        }
+      } else if (st.assigneeUserId && channel) {
+        // fallback: if nobody subscribed, ping assignee once
         await channel.send({
           content: `<@${st.assigneeUserId}> ✅ **Order Arrived!** Enjoy your order!`,
           allowedMentions: { users: [st.assigneeUserId], parse: [] },
         }).catch(() => {});
       }
+
       clearInterval(timers.get(messageId)); timers.delete(messageId);
       try { await page.close({ runBeforeUnload: true }); } catch {}
       pages.delete(messageId);
@@ -648,10 +716,10 @@ async function startJob(channel, url, requesterUserId) {
 
   const assigneeUserId = await resolveChannelAssignee(channel, NOTIFY_ROLE_ID);
 
-  // Initial message
+  // Initial message (with DM toggle)
   const msg = await channel.send({
     embeds: [buildActiveEmbed({ statusLine: 'Starting…' }, url, { serverIconURL: getGuildIconURL(channel.guild) })],
-    components: [linkRow(url)],
+    components: [controlsRow(url, false)],
   });
 
   // Persist
@@ -666,11 +734,12 @@ async function startJob(channel, url, requesterUserId) {
     last_phase: null,
     last_hash: null,
     last_error_at: null,
+    dm_user_id: null, // persisted DM subscriber (none yet)
   });
 
   // Runtime
   pages.set(msg.id, page);
-  states.set(msg.id, { assigneeUserId, staticName: null, lastPhase: null });
+  states.set(msg.id, { assigneeUserId, staticName: null, lastPhase: null, dmUserId: null });
 
   await runOnceAndUpdate(msg.id);
   const timer = setInterval(() => runOnceAndUpdate(msg.id), POLL_INTERVAL_MS);
@@ -693,14 +762,14 @@ async function resumeAllFromDB() {
       if (!msg) {
         msg = await channel.send({
           embeds: [buildActiveEmbed({ statusLine: 'Resuming…' }, row.url, { serverIconURL: getGuildIconURL(channel.guild) })],
-          components: [linkRow(row.url)],
+          components: [controlsRow(row.url, !!row.dm_user_id)],
         });
         DB.updateByMessageId(row.message_id, { message_id: msg.id });
         row.message_id = msg.id;
       } else {
         await msg.edit({
           embeds: [buildActiveEmbed({ statusLine: 'Resuming…' }, row.url, { serverIconURL: getGuildIconURL(channel.guild) })],
-          components: [linkRow(row.url)],
+          components: [controlsRow(row.url, !!row.dm_user_id)],
         }).catch(() => {});
       }
 
@@ -710,6 +779,7 @@ async function resumeAllFromDB() {
         assigneeUserId: row.assignee_user_id || null,
         staticName: row.static_name || null,
         lastPhase: row.last_phase || null,
+        dmUserId: row.dm_user_id || null, // restore subscriber
       });
 
       await runOnceAndUpdate(row.message_id);
@@ -742,28 +812,92 @@ async function registerCommands() {
     log('✅ Slash commands registered (global)');
   }
 }
+
+/* ─────────────── Interactions ─────────────── */
 client.on('interactionCreate', async (i) => {
   try {
-    if (!i.isChatInputCommand()) return;
-    if (i.commandName !== 'track') return;
+    // --- Slash /track ---
+    if (i.isChatInputCommand()) {
+      if (i.commandName !== 'track') return;
 
-    const url = i.options.getString('url', true).trim();
+      const url = i.options.getString('url', true).trim();
 
-    // Validate URL early
-    if (!/^https?:\/\/(www\.)?ubereats\.com\/orders\//i.test(url)) {
-      return ephemeralTo(i, '❌ Please provide a **public Uber Eats order link** like `https://www.ubereats.com/orders/...`');
-    }
+      // Validate URL early
+      if (!/^https?:\/\/(www\.)?ubereats\.com\/orders\//i.test(url)) {
+        return ephemeralTo(i, '❌ Please provide a **public Uber Eats order link** like `https://www.ubereats.com/orders/...`');
+      }
 
-    await ephemeralTo(i, 'Starting tracker…');
+      await ephemeralTo(i, 'Starting tracker…');
 
-    try {
-      await startJob(i.channel, url, i.user.id);
-    } catch (e) {
-      await ephemeralTo(i, `❌ Could not start tracker: \`${String(e?.message || e)}\``);
+      try {
+        await startJob(i.channel, url, i.user.id);
+      } catch (e) {
+        await ephemeralTo(i, `❌ Could not start tracker: \`${String(e?.message || e)}\``);
+        return;
+      }
+
+      // 🔔 Trigger 116-bot's /completed immediately (bridge message in same ticket)
+      try {
+        const dedupeId = `track-${i.id}`;   // in-memory dedupe key on 116-bot
+        await notifyCompletedInChannel(client, i.channel.id, {
+          userId: i.user.id,       // actor (staff) who ran /track
+          orderId: dedupeId,       // used only for dedupe; not stored
+          total: 0,                // unknown now; not stored
+          secret: BRIDGE_SECRET,   // must match 116-bot
+        });
+      } catch (e) {
+        err('immediate /completed trigger failed:', e?.message || e);
+      }
+
+      await ephemeralTo(i, `✅ Started tracking: \`${url.split('/').pop()}\``);
       return;
     }
 
-    await ephemeralTo(i, `✅ Started tracking: \`${url.split('/').pop()}\``);
+    // --- Button: DM UPDATES toggle (enable/disable & persist) ---
+    if (i.isButton() && i.customId === 'dm-updates') {
+      const messageId = i.message?.id;
+      const job = DB.getByMessageId(messageId);
+      if (!job) {
+        return i.reply({ content: '⚠️ This tracking session was not found.', flags: MessageFlags.Ephemeral });
+      }
+
+      const st = states.get(messageId) || {};
+      const currently = st.dmUserId || job.dm_user_id || null;
+
+      if (currently === i.user.id) {
+        // toggle OFF
+        st.dmUserId = null;
+        states.set(messageId, st);
+        DB.updateByMessageId(messageId, { dm_user_id: null });
+
+        try {
+          await i.message.edit({ components: [controlsRow(job.url, false)] }).catch(() => {});
+        } catch {}
+        return i.reply({ content: '🔕 DM updates disabled for this order.', flags: MessageFlags.Ephemeral });
+      } else {
+        // toggle ON (to this clicker)
+        st.dmUserId = i.user.id;
+        states.set(messageId, st);
+        DB.updateByMessageId(messageId, { dm_user_id: i.user.id });
+
+        try {
+          await i.message.edit({ components: [controlsRow(job.url, true)] }).catch(() => {});
+        } catch {}
+
+        // Try to DM immediately so the user knows it's working
+        let dmOk = true;
+        try {
+          const u = await client.users.fetch(i.user.id).catch(() => null);
+          if (u) await u.send('✅ You will receive **DM updates** for this order. I’ll only ping in the ticket when it’s **delivered**.').catch(() => { dmOk = false; });
+          else dmOk = false;
+        } catch { dmOk = false; }
+
+        return i.reply({
+          content: dmOk ? '✅ DM updates enabled.' : '⚠️ I could not DM you. Please enable DMs from server members and click again.',
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+    }
   } catch (e) {
     await ephemeralTo(i, `❌ Error: \`${String(e?.message || e)}\``);
   }
